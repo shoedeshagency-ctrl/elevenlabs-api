@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: elevenlabs-api
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: API_SECRET
+        sync: false
+      - key: TOTP_SECRET
+        sync: false
+      - key: ACCOUNTS_JSON
+        sync: false
