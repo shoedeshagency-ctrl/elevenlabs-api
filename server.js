@@ -792,6 +792,15 @@ app.post("/admin/accounts/remove", adminAuth, (req, res) => {
   res.json({ ok: true });
 });
 
+app.post("/admin/accounts/toggle", adminAuth, (req, res) => {
+  const { email, active } = req.body;
+  const acct = accounts.find(a => a.email === email);
+  if (!acct) return res.json({ ok: false, error: "Not found" });
+  acct.active = !!active;
+  slog("INFO", `[admin] ${active ? "Enabled" : "Disabled"} account: ${email}`);
+  res.json({ ok: true, email, active: acct.active });
+});
+
 app.get("/admin/accounts/export", adminAuth, (req, res) => {
   // Return accounts without exposing full tokens in export (keep refresh_token for persistence)
   const safe = accounts.map(a => ({
