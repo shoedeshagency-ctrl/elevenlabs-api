@@ -5,9 +5,21 @@ const path = require("path");
 const cookieParser = require("cookie-parser");
 const OTPAuth = require("otpauth");
 const QRCode = require("qrcode");
+const jwt = require("jsonwebtoken");
 
 const PORT = process.env.PORT || 3000;
 const API_SECRET = process.env.API_SECRET || "";
+// Separate signing secret for short-lived JWTs — auto-generated per boot if not set
+const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString("hex");
+const JWT_TTL_SEC = 60; // tokens valid for 60 seconds
+
+// ── One-time-use nonce store ──────────────────────────────────────────────────
+// Nonces expire at the same time as the JWT (60s), cleaned up every 90s
+const usedNonces = new Map(); // nonce → expires_at (ms)
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, exp] of usedNonces) if (exp < now) usedNonces.delete(k);
+}, 90_000).unref();
 
 // ── Firebase / ElevenLabs constants ──────────────────────────────────────────
 const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY || "AIzaSyDm5AQrmfZpIiQ1TAJjS6AOijGZQ6LOZL4";
@@ -272,12 +284,34 @@ function slog(level, msg) {
   console.log(`[${level}] ${msg}`);
 }
 
-// ── API key middleware ─────────────────────────────────────────────────────────
+// ── API key middleware (used only for /v1/auth/token) ─────────────────────────
 function requireApiKey(req, res, next) {
-  if (!API_SECRET) return next(); // no secret set — open access
+  if (!API_SECRET) return next();
   const key = req.headers["x-api-key"] || req.query.api_key;
   if (key === API_SECRET) return next();
-  res.status(401).json({ error: "Invalid or missing API key. Send X-API-Key header." });
+  res.status(401).json({ error: "Invalid or missing API key." });
+}
+
+// ── JWT middleware (replay-proof — one-time-use nonce + 60s expiry) ───────────
+function requireJWT(req, res, next) {
+  if (!API_SECRET) return next(); // no auth configured — open
+  const auth = req.headers["authorization"] || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+  if (!token) return res.status(401).json({ error: "Missing Bearer token. Call GET /v1/auth/token first." });
+  let payload;
+  try {
+    payload = jwt.verify(token, JWT_SECRET);
+  } catch (e) {
+    return res.status(401).json({ error: "Token invalid or expired. Get a fresh one from GET /v1/auth/token." });
+  }
+  // One-time-use check
+  const nonce = payload.nonce;
+  if (usedNonces.has(nonce)) {
+    return res.status(401).json({ error: "Token already used. Each token is single-use — request a new one." });
+  }
+  usedNonces.set(nonce, (payload.exp * 1000) + 5000); // keep 5s past JWT expiry for clock skew
+  req.jwtPayload = payload;
+  next();
 }
 
 // ── TOTP admin auth ───────────────────────────────────────────────────────────
@@ -343,6 +377,23 @@ app.get("/health", (req, res) => {
   });
 });
 
+// ── Auth token endpoints ──────────────────────────────────────────────────────
+// External callers: GET /v1/auth/token — requires X-API-Key, returns 60s single-use JWT
+app.get("/v1/auth/token", requireApiKey, (req, res) => {
+  const nonce = crypto.randomBytes(16).toString("hex");
+  const token = jwt.sign({ nonce }, JWT_SECRET, { expiresIn: JWT_TTL_SEC });
+  res.json({ token, expires_in: JWT_TTL_SEC, note: "Single-use. One token = one request." });
+});
+
+// Web UI: GET /v1/webui/token — no API key required (JWT itself is single-use + 60s, replay-proof)
+// The web UI is served from the same origin; external callers with a webui token can only make ONE request.
+app.get("/v1/webui/token", (req, res) => {
+  if (!API_SECRET) { return res.json({ token: null }); } // no auth configured
+  const nonce = crypto.randomBytes(16).toString("hex");
+  const token = jwt.sign({ nonce, src: "webui" }, JWT_SECRET, { expiresIn: JWT_TTL_SEC });
+  res.json({ token, expires_in: JWT_TTL_SEC });
+});
+
 app.get("/v1/models", async (req, res) => {
   const type = req.query.type || "image";
   const acct = pickAccount();
@@ -366,7 +417,7 @@ app.get("/logs", (req, res) => {
 });
 
 // ── Generation endpoints ──────────────────────────────────────────────────────
-app.post("/v1/images/generate", requireApiKey, async (req, res) => {
+app.post("/v1/images/generate", requireJWT, async (req, res) => {
   const { prompt, model, model_id, aspect_ratio = "1:1", generations_count = 1, ref_url } = req.body;
   if (!prompt) return res.status(400).json({ error: "prompt is required" });
 
@@ -434,7 +485,7 @@ app.post("/v1/images/generate", requireApiKey, async (req, res) => {
   });
 });
 
-app.post("/v1/videos/generate", requireApiKey, async (req, res) => {
+app.post("/v1/videos/generate", requireJWT, async (req, res) => {
   const { prompt, model, model_id, aspect_ratio = "16:9", duration_secs, generate_audio = true, start_image_url, end_image_url } = req.body;
   if (!prompt) return res.status(400).json({ error: "prompt is required" });
 
@@ -488,19 +539,19 @@ app.post("/v1/videos/generate", requireApiKey, async (req, res) => {
 });
 
 // ── Job polling ───────────────────────────────────────────────────────────────
-app.get("/v1/jobs/:id", requireApiKey, (req, res) => {
+app.get("/v1/jobs/:id", requireJWT, (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).json({ error: "Job not found or expired" });
   res.json(job);
 });
 
-app.get("/v1/jobs", requireApiKey, (req, res) => {
+app.get("/v1/jobs", requireJWT, (req, res) => {
   const list = [...jobs.values()].sort((a, b) => b.created_at - a.created_at).slice(0, 100);
   res.json({ jobs: list, total: list.length });
 });
 
 // ── Account info ──────────────────────────────────────────────────────────────
-app.get("/v1/accounts", requireApiKey, async (req, res) => {
+app.get("/v1/accounts", requireJWT, async (req, res) => {
   const result = await Promise.all(accounts.map(async (acct) => {
     try {
       const token = await getActiveToken(acct);
@@ -520,7 +571,7 @@ app.get("/v1/accounts", requireApiKey, async (req, res) => {
 });
 
 // ── Asset upload ──────────────────────────────────────────────────────────────
-app.post("/v1/upload", requireApiKey, async (req, res) => {
+app.post("/v1/upload", requireJWT, async (req, res) => {
   const { image_url, image_data, mime_type } = req.body;
   const acct = pickAccount();
   if (!acct) return res.status(503).json({ error: "No active accounts" });

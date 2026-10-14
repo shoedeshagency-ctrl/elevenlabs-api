@@ -191,14 +191,36 @@ async function api(path, opts = {}) {
   return data;
 }
 
+// Fetch a fresh single-use JWT from the server for replay-protected requests
+async function getToken() {
+  const r = await fetch(API + "/v1/webui/token");
+  const d = await r.json();
+  return d.token; // null if auth not configured
+}
+
+async function authApi(path, opts = {}) {
+  const token = await getToken();
+  const headers = {
+    "Content-Type": "application/json",
+    ...(token ? { "Authorization": "Bearer " + token } : {}),
+    ...(opts.headers || {}),
+  };
+  const res = await fetch(API + path, { ...opts, headers, body: opts.body ? JSON.stringify(opts.body) : undefined });
+  let data = null;
+  try { data = await res.json(); } catch {}
+  if (!res.ok) throw new Error((data && data.error) || "HTTP " + res.status);
+  return data;
+}
+
 async function submitAndPoll(endpoint, payload, onTick) {
-  const sub = await api(endpoint, { method: "POST", body: payload });
+  // Each request (submit + every poll) needs its own fresh single-use JWT
+  const sub = await authApi(endpoint, { method: "POST", body: payload });
   if (!sub.job_id) return sub.result || sub;
   const end = Date.now() + POLL_TIMEOUT_MS;
   let wait = (sub.retry_after || 3) * 1000;
   while (Date.now() < end) {
     await new Promise(r => setTimeout(r, wait));
-    const job = await api("/v1/jobs/" + sub.job_id);
+    const job = await authApi("/v1/jobs/" + sub.job_id);
     onTick && onTick(job.status);
     if (job.status === "completed") return { ...job.result, _account: job.account };
     if (job.status === "failed") throw new Error(job.error || "Generation failed");
