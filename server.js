@@ -90,6 +90,23 @@ function loadAccounts() {
 }
 loadAccounts();
 
+// Warm up credits_cached after startup so pickAccount() has real data
+async function warmUpCredits() {
+  for (const acct of accounts) {
+    try {
+      const token = await getActiveToken(acct);
+      const sub = await getSubscription(token);
+      if (sub !== null) {
+        acct.sub_cached = sub;
+        acct.credits_cached = sub.credits_remaining ?? 0;
+      }
+    } catch (e) {
+      console.error(`[warmup] ${acct.email}: ${e.message}`);
+    }
+  }
+}
+setTimeout(warmUpCredits, 2000);
+
 function saveAccountsToMemory() {
   // In production, persist back to env var isn't possible from within the process.
   // Accounts are kept in memory. To persist across restarts, update ACCOUNTS_JSON in Render dashboard.
@@ -132,12 +149,19 @@ function getHeaders(idToken, extra = {}) {
   };
 }
 
-// Pick a random active account (optionally requiring minimum credits)
+// Pick a random active account — prefer accounts with known credits > 0
 function pickAccount(minCredits = 0) {
-  const eligible = accounts.filter(a => a.active !== false &&
-    (minCredits === 0 || (a.credits_cached || 0) >= minCredits));
-  if (!eligible.length) return null;
-  return eligible[Math.floor(Math.random() * eligible.length)];
+  const active = accounts.filter(a => a.active !== false);
+  if (!active.length) return null;
+  // First try accounts with known positive credits
+  const withCredits = active.filter(a => (a.credits_cached || 0) > (minCredits || 0));
+  if (withCredits.length) return withCredits[Math.floor(Math.random() * withCredits.length)];
+  // Fall back to accounts with unknown credits (credits_cached === 0 means not yet fetched)
+  if (minCredits === 0) {
+    const unknown = active.filter(a => (a.credits_cached || 0) === 0);
+    if (unknown.length) return unknown[Math.floor(Math.random() * unknown.length)];
+  }
+  return null;
 }
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
@@ -581,7 +605,7 @@ app.get("/v1/accounts", requireJWT, async (req, res) => {
     try {
       const token = await getActiveToken(acct);
       const sub = await getSubscription(token);
-      if (sub !== null) acct.sub_cached = sub;
+      if (sub !== null) { acct.sub_cached = sub; acct.credits_cached = sub.credits_remaining ?? 0; }
       const s = sub ?? acct.sub_cached;
       return {
         email:             acct.email,
