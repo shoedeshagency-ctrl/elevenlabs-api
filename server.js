@@ -9,6 +9,9 @@ const jwt = require("jsonwebtoken");
 
 const PORT = process.env.PORT || 3000;
 const API_SECRET = process.env.API_SECRET || "";
+// Internal shared secret — frontend sends this header, backend rejects without it
+// Blocks anyone who finds the backend URL from calling it directly
+const INTERNAL_SECRET = process.env.INTERNAL_SECRET || "";
 // Separate signing secret for short-lived JWTs — auto-generated per boot if not set
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString("hex");
 const JWT_TTL_SEC = 60; // tokens valid for 60 seconds
@@ -284,8 +287,17 @@ function slog(level, msg) {
   console.log(`[${level}] ${msg}`);
 }
 
+// ── Internal secret check — rejects requests not from the frontend ────────────
+function checkInternalSecret(req, res) {
+  if (!INTERNAL_SECRET) return true; // not configured — open
+  if (req.headers["x-internal-secret"] === INTERNAL_SECRET) return true;
+  res.status(403).json({ error: "Forbidden." });
+  return false;
+}
+
 // ── API key middleware (used only for /v1/auth/token) ─────────────────────────
 function requireApiKey(req, res, next) {
+  if (!checkInternalSecret(req, res)) return;
   if (!API_SECRET) return next();
   const key = req.headers["x-api-key"] || req.query.api_key;
   if (key === API_SECRET) return next();
@@ -294,6 +306,7 @@ function requireApiKey(req, res, next) {
 
 // ── JWT middleware (replay-proof — one-time-use nonce + 60s expiry) ───────────
 function requireJWT(req, res, next) {
+  if (!checkInternalSecret(req, res)) return;
   if (!API_SECRET) return next(); // no auth configured — open
   const auth = req.headers["authorization"] || "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
