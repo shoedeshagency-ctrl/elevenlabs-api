@@ -261,10 +261,17 @@ async function uploadAsset(idToken, fileBuffer, filename, mimeType) {
   return res.json();
 }
 
-async function getCredits(idToken) {
+async function getSubscription(idToken) {
   try {
     const resp = await apiGet(`${API_BASE}/user/subscription`, getHeaders(idToken));
-    return resp.credits || 0;
+    const c = resp.credits || {};
+    return {
+      credits_remaining: c.remaining_credits ?? 0,
+      credits_limit:     c.limit ?? 0,
+      credits_used:      c.used ?? 0,
+      plan:    resp.product_id || resp.plan_tier || "unknown",
+      status:  resp.status || "unknown",
+    };
   } catch { return null; }
 }
 
@@ -571,13 +578,18 @@ app.get("/v1/accounts", requireJWT, async (req, res) => {
   const result = await Promise.all(accounts.map(async (acct) => {
     try {
       const token = await getActiveToken(acct);
-      const credits = await getCredits(token);
-      if (credits !== null) acct.credits_cached = credits;
+      const sub = await getSubscription(token);
+      if (sub !== null) acct.sub_cached = sub;
+      const s = sub ?? acct.sub_cached;
       return {
-        email: acct.email,
-        active: acct.active !== false,
-        credits: credits ?? acct.credits_cached,
-        token_expires_at: acct.token_expires_at,
+        email:             acct.email,
+        active:            acct.active !== false,
+        credits:           s?.credits_remaining ?? null,
+        credits_limit:     s?.credits_limit ?? null,
+        credits_used:      s?.credits_used ?? null,
+        plan:              s?.plan ?? null,
+        status:            s?.status ?? null,
+        token_expires_at:  acct.token_expires_at,
       };
     } catch (e) {
       return { email: acct.email, active: false, error: e.message };
