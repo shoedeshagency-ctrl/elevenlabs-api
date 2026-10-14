@@ -375,6 +375,9 @@ function verifyTOTP(code) {
   return TOTP_INSTANCE.validate({ token: String(code).replace(/\s/g, ""), window: 1 }) !== null;
 }
 function adminAuth(req, res, next) {
+  // Machine-to-machine: frontend's backendAdmin() sends X-API-Key + X-Internal-Secret
+  if (API_SECRET && req.headers["x-api-key"] === API_SECRET &&
+      INTERNAL_SECRET && req.headers["x-internal-secret"] === INTERNAL_SECRET) return next();
   if (isAdminSession(req.cookies?.admin_session)) return next();
   if (req.method !== "GET") return res.status(401).json({ ok: false, error: "Session expired — log in at /admin/login" });
   res.redirect("/admin/login?next=" + encodeURIComponent(req.path));
