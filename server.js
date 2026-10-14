@@ -287,22 +287,23 @@ async function uploadAsset(idToken, fileBuffer, filename, mimeType) {
 
 async function getSubscription(idToken) {
   try {
-    // Real endpoint: /v1/user/subscription (not /v1/coreapp/user/subscription)
-    const resp = await apiGet("https://api.elevenlabs.io/v1/user/subscription", getHeaders(idToken));
-    const limit     = resp.character_limit     ?? 0;
-    const used      = resp.character_count     ?? 0;
+    const resp = await apiGet(`${API_BASE}/user/customer`, getHeaders(idToken));
+    const c = resp.credits || {};
+    const remaining = c.remaining_credits ?? 0;
+    const used      = c.used_credits      ?? 0;
+    const limit     = c.total_credits     ?? 0;
     return {
-      credits_remaining: limit - used,
+      credits_remaining: remaining,
       credits_limit:     limit,
       credits_used:      used,
-      plan:   resp.tier   || "unknown",
-      status: resp.status || "unknown",
+      plan:   (resp.subscription?.tier)   || c.tier   || "unknown",
+      status: (resp.subscription?.status) || c.status || "unknown",
     };
   } catch { return null; }
 }
 
 async function getModels(idToken) {
-  return apiGet(`${API_BASE}/models`, getHeaders(idToken));
+  return apiGet(`${API_BASE}/projects/content/models`, getHeaders(idToken));
 }
 
 // ── Express app ───────────────────────────────────────────────────────────────
