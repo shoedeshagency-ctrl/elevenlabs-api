@@ -153,15 +153,37 @@ function getHeaders(idToken, extra = {}) {
 function pickAccount(minCredits = 0) {
   const active = accounts.filter(a => a.active !== false);
   if (!active.length) return null;
-  // First try accounts with known positive credits
   const withCredits = active.filter(a => (a.credits_cached || 0) > (minCredits || 0));
   if (withCredits.length) return withCredits[Math.floor(Math.random() * withCredits.length)];
-  // Fall back to accounts with unknown credits (credits_cached === 0 means not yet fetched)
   if (minCredits === 0) {
     const unknown = active.filter(a => (a.credits_cached || 0) === 0);
     if (unknown.length) return unknown[Math.floor(Math.random() * unknown.length)];
   }
   return null;
+}
+
+// Try fn(account) across all active accounts until one succeeds.
+// Skips an account on 401/403 and tries the next one.
+async function tryWithFallback(fn) {
+  const active = accounts.filter(a => a.active !== false);
+  if (!active.length) throw new Error("No active accounts");
+  // shuffle so we don't always hammer the same account first
+  const shuffled = active.slice().sort(() => Math.random() - 0.5);
+  let lastErr;
+  for (const acct of shuffled) {
+    try {
+      return await fn(acct);
+    } catch (e) {
+      const status = e.status;
+      if (status === 401 || status === 403) {
+        slog("WARN", `account ${acct.email} returned ${status}, trying next`);
+        lastErr = e;
+        continue;
+      }
+      throw e; // non-auth error — propagate immediately
+    }
+  }
+  throw lastErr || new Error("All accounts failed");
 }
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
@@ -472,61 +494,44 @@ app.post("/v1/images/generate", requireJWT, async (req, res) => {
   if (!prompt) return res.status(400).json({ error: "prompt is required" });
 
   const actualModel = model_id || model || "gemini-2.5-flash-image";
-  const acct = pickAccount();
-  if (!acct) return res.status(503).json({ error: "No active accounts" });
+  if (!accounts.filter(a => a.active !== false).length) return res.status(503).json({ error: "No active accounts" });
 
   const job = createJob("image", { prompt, model: actualModel });
   res.status(202).json({ job_id: job.id, status: "queued", retry_after: 3, poll_url: `/v1/jobs/${job.id}` });
 
-  // Run async
   setImmediate(async () => {
     try {
       updateJob(job.id, { status: "processing" });
-      const token = await getActiveToken(acct);
+      const { images, project_id, usedAcct } = await tryWithFallback(async (acct) => {
+        const token = await getActiveToken(acct);
 
-      let ref_asset_id = null;
-      if (ref_url) {
-        // Download ref image and upload as asset
-        const imgRes = await fetch(ref_url, { signal: AbortSignal.timeout(30000) });
-        if (!imgRes.ok) throw new Error(`Failed to fetch reference image: ${imgRes.status}`);
-        const buf = Buffer.from(await imgRes.arrayBuffer());
-        const mime = imgRes.headers.get("content-type") || "image/jpeg";
-        const ext = mime.split("/")[1] || "jpg";
-        const asset = await uploadAsset(token, buf, `ref.${ext}`, mime);
-        ref_asset_id = asset.id;
-      }
-
-      const { project_id } = await generateImage(token, {
-        prompt, model_id: actualModel, aspect_ratio,
-        generations_count, ref_asset_id,
-      });
-
-      slog("INFO", `[image] job=${job.id} project=${project_id} model=${actualModel} account=${acct.email}`);
-      const result = await waitForImageCompletion(token, project_id);
-
-      // Extract image URLs from SSE result
-      const images = [];
-      if (result.content_url) {
-        images.push({
-          url: result.content_url,
-          preview_url: result.content_capped_resolution_url || result.preview_content_url,
-        });
-      }
-      // Multiple generations
-      if (result.sessions) {
-        for (const s of result.sessions) {
-          for (const g of (s.generations || [])) {
-            if (g.content_url) images.push({ url: g.content_url, preview_url: g.content_capped_resolution_url });
-          }
+        let ref_asset_id = null;
+        if (ref_url) {
+          const imgRes = await fetch(ref_url, { signal: AbortSignal.timeout(30000) });
+          if (!imgRes.ok) throw new Error(`Failed to fetch reference image: ${imgRes.status}`);
+          const buf = Buffer.from(await imgRes.arrayBuffer());
+          const mime = imgRes.headers.get("content-type") || "image/jpeg";
+          const asset = await uploadAsset(token, buf, `ref.${mime.split("/")[1] || "jpg"}`, mime);
+          ref_asset_id = asset.id;
         }
-      }
 
-      updateJob(job.id, {
-        status: "completed",
-        account: acct.email,
-        result: { images, project_id },
-        retry_after: undefined,
+        const { project_id } = await generateImage(token, {
+          prompt, model_id: actualModel, aspect_ratio, generations_count, ref_asset_id,
+        });
+        slog("INFO", `[image] job=${job.id} project=${project_id} model=${actualModel} account=${acct.email}`);
+        const result = await waitForImageCompletion(token, project_id);
+
+        const images = [];
+        if (result.content_url) images.push({ url: result.content_url, preview_url: result.content_capped_resolution_url || result.preview_content_url });
+        if (result.sessions) {
+          for (const s of result.sessions)
+            for (const g of (s.generations || []))
+              if (g.content_url) images.push({ url: g.content_url, preview_url: g.content_capped_resolution_url });
+        }
+        return { images, project_id, usedAcct: acct.email };
       });
+
+      updateJob(job.id, { status: "completed", account: usedAcct, result: { images, project_id }, retry_after: undefined });
       slog("INFO", `[image] job=${job.id} done — ${images.length} image(s)`);
     } catch (e) {
       slog("ERROR", `[image] job=${job.id} failed: ${e.message}`);
@@ -540,8 +545,7 @@ app.post("/v1/videos/generate", requireJWT, async (req, res) => {
   if (!prompt) return res.status(400).json({ error: "prompt is required" });
 
   const actualModel = model_id || model || "flux-3-video";
-  const acct = pickAccount();
-  if (!acct) return res.status(503).json({ error: "No active accounts" });
+  if (!accounts.filter(a => a.active !== false).length) return res.status(503).json({ error: "No active accounts" });
 
   const job = createJob("video", { prompt, model: actualModel });
   res.status(202).json({ job_id: job.id, status: "queued", retry_after: 10, poll_url: `/v1/jobs/${job.id}` });
@@ -549,38 +553,34 @@ app.post("/v1/videos/generate", requireJWT, async (req, res) => {
   setImmediate(async () => {
     try {
       updateJob(job.id, { status: "processing" });
-      const token = await getActiveToken(acct);
+      const { project_id: vProjectId, video_url, usedAcct } = await tryWithFallback(async (acct) => {
+        const token = await getActiveToken(acct);
 
-      async function fetchAndUpload(url) {
-        if (!url) return null;
-        const r = await fetch(url, { signal: AbortSignal.timeout(30000) });
-        if (!r.ok) throw new Error(`Failed to fetch asset: ${r.status}`);
-        const buf = Buffer.from(await r.arrayBuffer());
-        const mime = r.headers.get("content-type") || "image/jpeg";
-        const ext = mime.split("/")[1] || "jpg";
-        const asset = await uploadAsset(token, buf, `asset.${ext}`, mime);
-        return asset.id;
-      }
+        async function fetchAndUpload(url) {
+          if (!url) return null;
+          const r = await fetch(url, { signal: AbortSignal.timeout(30000) });
+          if (!r.ok) throw new Error(`Failed to fetch asset: ${r.status}`);
+          const buf = Buffer.from(await r.arrayBuffer());
+          const mime = r.headers.get("content-type") || "image/jpeg";
+          const asset = await uploadAsset(token, buf, `asset.${mime.split("/")[1] || "jpg"}`, mime);
+          return asset.id;
+        }
 
-      const start_asset_id = await fetchAndUpload(start_image_url);
-      const end_asset_id = await fetchAndUpload(end_image_url);
+        const start_asset_id = await fetchAndUpload(start_image_url);
+        const end_asset_id = await fetchAndUpload(end_image_url);
 
-      const { project_id } = await generateVideo(token, {
-        prompt, model_id: actualModel, aspect_ratio, duration_secs, generate_audio,
-        start_asset_id, end_asset_id,
+        const { project_id } = await generateVideo(token, {
+          prompt, model_id: actualModel, aspect_ratio, duration_secs, generate_audio,
+          start_asset_id, end_asset_id,
+        });
+
+        const result = await waitForImageCompletion(token, project_id);
+        const video_url = result.content_url || result.video_url;
+        return { project_id, video_url, usedAcct: acct.email };
       });
 
-      slog("INFO", `[video] job=${job.id} project=${project_id} model=${actualModel} account=${acct.email}`);
-      const result = await waitForImageCompletion(token, project_id); // same SSE endpoint
-
-      const video_url = result.content_url || result.video_url;
-      updateJob(job.id, {
-        status: "completed",
-        account: acct.email,
-        result: { url: video_url, project_id },
-        retry_after: undefined,
-      });
-      slog("INFO", `[video] job=${job.id} done`);
+      updateJob(job.id, { status: "completed", account: usedAcct, result: { url: video_url, project_id: vProjectId }, retry_after: undefined });
+      slog("INFO", `[video] job=${job.id} done account=${usedAcct}`);
     } catch (e) {
       slog("ERROR", `[video] job=${job.id} failed: ${e.message}`);
       updateJob(job.id, { status: "failed", error: e.message });
