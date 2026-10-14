@@ -263,14 +263,16 @@ async function uploadAsset(idToken, fileBuffer, filename, mimeType) {
 
 async function getSubscription(idToken) {
   try {
-    const resp = await apiGet(`${API_BASE}/user/subscription`, getHeaders(idToken));
-    const c = resp.credits || {};
+    // Real endpoint: /v1/user/subscription (not /v1/coreapp/user/subscription)
+    const resp = await apiGet("https://api.elevenlabs.io/v1/user/subscription", getHeaders(idToken));
+    const limit     = resp.character_limit     ?? 0;
+    const used      = resp.character_count     ?? 0;
     return {
-      credits_remaining: c.remaining_credits ?? 0,
-      credits_limit:     c.limit ?? 0,
-      credits_used:      c.used ?? 0,
-      plan:    resp.product_id || resp.plan_tier || "unknown",
-      status:  resp.status || "unknown",
+      credits_remaining: limit - used,
+      credits_limit:     limit,
+      credits_used:      used,
+      plan:   resp.tier   || "unknown",
+      status: resp.status || "unknown",
     };
   } catch { return null; }
 }
