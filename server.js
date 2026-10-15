@@ -241,7 +241,10 @@ async function readSSE(url, headers, timeoutMs = 180000) {
       headers: { ...headers, "accept": "text/event-stream" },
       signal: controller.signal,
     });
-    if (!res.ok) throw new Error(`SSE ${res.status}`);
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw Object.assign(new Error(`SSE ${res.status}`), { status: res.status, data: body });
+    }
     const reader = res.body.getReader();
     const dec = new TextDecoder();
     let buf = "";
@@ -559,7 +562,8 @@ app.post("/v1/images/generate", requireJWT, async (req, res) => {
       updateJob(job.id, { status: "completed", account: usedAcct, result: { images, project_id }, retry_after: undefined });
       slog("INFO", `[image] job=${job.id} done — ${images.length} image(s)`);
     } catch (e) {
-      slog("ERROR", `[image] job=${job.id} failed: ${e.message}`);
+      const detail = e.data ? ` | body: ${JSON.stringify(e.data).slice(0, 300)}` : "";
+      slog("ERROR", `[image] job=${job.id} failed: ${e.message}${detail}`);
       updateJob(job.id, { status: "failed", error: e.message });
     }
   });
@@ -607,7 +611,8 @@ app.post("/v1/videos/generate", requireJWT, async (req, res) => {
       updateJob(job.id, { status: "completed", account: usedAcct, result: { url: video_url, project_id: vProjectId }, retry_after: undefined });
       slog("INFO", `[video] job=${job.id} done account=${usedAcct}`);
     } catch (e) {
-      slog("ERROR", `[video] job=${job.id} failed: ${e.message}`);
+      const detail = e.data ? ` | body: ${JSON.stringify(e.data).slice(0, 300)}` : "";
+      slog("ERROR", `[video] job=${job.id} failed: ${e.message}${detail}`);
       updateJob(job.id, { status: "failed", error: e.message });
     }
   });
