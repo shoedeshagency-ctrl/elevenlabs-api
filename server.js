@@ -9,12 +9,12 @@ const jwt = require("jsonwebtoken");
 
 const PORT = process.env.PORT || 3000;
 const API_SECRET = process.env.API_SECRET || "";
-// Internal shared secret — frontend sends this header, backend rejects without it
-// Blocks anyone who finds the backend URL from calling it directly
 const INTERNAL_SECRET = process.env.INTERNAL_SECRET || "";
-// Separate signing secret for short-lived JWTs — auto-generated per boot if not set
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString("hex");
-const JWT_TTL_SEC = 60; // tokens valid for 60 seconds
+const JWT_TTL_SEC = 60;
+// Self-persistence: backend writes its own ACCOUNTS_JSON to Render env var after every mutation
+const RENDER_API_KEY = process.env.RENDER_API_KEY || "";
+const RENDER_SVC_ID  = process.env.RENDER_SVC_ID  || "";  // this service's own ID
 
 // ── One-time-use nonce store ──────────────────────────────────────────────────
 // Nonces expire at the same time as the JWT (60s), cleaned up every 90s
@@ -107,10 +107,35 @@ async function warmUpCredits() {
 }
 setTimeout(warmUpCredits, 2000);
 
-function saveAccountsToMemory() {
-  // In production, persist back to env var isn't possible from within the process.
-  // Accounts are kept in memory. To persist across restarts, update ACCOUNTS_JSON in Render dashboard.
-  // The /admin/accounts endpoints let you do this.
+// Persist current accounts to Render env var (self-write).
+// Called after every mutation so restarts always load the latest state.
+// Does NOT trigger a redeploy — Render only redeploys on env-var changes when
+// "auto-deploy on env change" is enabled; we keep that OFF on the backend service.
+async function persistAccounts() {
+  if (!RENDER_API_KEY || !RENDER_SVC_ID) return;
+  try {
+    const safe = accounts.map(a => ({
+      email:         a.email,
+      refresh_token: a.refresh_token,
+      active:        a.active !== false,
+    }));
+    const listRes = await fetch(`https://api.render.com/v1/services/${RENDER_SVC_ID}/env-vars`, {
+      headers: { "Authorization": `Bearer ${RENDER_API_KEY}` },
+    });
+    const existing = await listRes.json();
+    const envVars = (existing || [])
+      .map(e => e.envVar || e)
+      .filter(e => e.key && e.key !== "ACCOUNTS_JSON");
+    envVars.push({ key: "ACCOUNTS_JSON", value: JSON.stringify(safe) });
+    await fetch(`https://api.render.com/v1/services/${RENDER_SVC_ID}/env-vars`, {
+      method: "PUT",
+      headers: { "Authorization": `Bearer ${RENDER_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify(envVars),
+    });
+    slog("INFO", `[persist] Saved ${safe.length} account(s) to Render env var`);
+  } catch (e) {
+    slog("ERROR", `[persist] Failed: ${e.message}`);
+  }
 }
 
 async function refreshToken(account) {
@@ -818,6 +843,7 @@ app.post("/admin/accounts/add", adminAuth, async (req, res) => {
     };
     accounts.push(acct);
     slog("INFO", `[admin] Added account: ${email}`);
+    persistAccounts();
     res.json({ ok: true, email });
   } catch (e) {
     slog("ERROR", `[admin] Add account ${email}: ${e.message}`);
@@ -831,6 +857,7 @@ app.post("/admin/accounts/remove", adminAuth, (req, res) => {
   if (idx === -1) return res.json({ ok: false, error: "Not found" });
   accounts.splice(idx, 1);
   slog("INFO", `[admin] Removed account: ${email}`);
+  persistAccounts();
   res.json({ ok: true });
 });
 
@@ -840,6 +867,7 @@ app.post("/admin/accounts/toggle", adminAuth, (req, res) => {
   if (!acct) return res.json({ ok: false, error: "Not found" });
   acct.active = !!active;
   slog("INFO", `[admin] ${active ? "Enabled" : "Disabled"} account: ${email}`);
+  persistAccounts();
   res.json({ ok: true, email, active: acct.active });
 });
 
