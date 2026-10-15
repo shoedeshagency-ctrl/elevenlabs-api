@@ -543,6 +543,7 @@ app.post("/v1/images/generate", requireJWT, async (req, res) => {
           ref_asset_id = asset.id;
         }
 
+        slog("INFO", `[image] job=${job.id} calling generate model=${actualModel} account=${acct.email}`);
         const { project_id } = await generateImage(token, {
           prompt, model_id: actualModel, aspect_ratio, generations_count, ref_asset_id,
         });
