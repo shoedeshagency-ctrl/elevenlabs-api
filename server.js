@@ -331,7 +331,10 @@ async function uploadAsset(idToken, fileBuffer, filename, mimeType) {
     method: "POST", headers: hdrs, body,
     signal: AbortSignal.timeout(60000),
   });
-  if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => "");
+    throw Object.assign(new Error(`Upload failed: ${res.status}`), { status: res.status, data: errBody });
+  }
   return res.json();
 }
 
@@ -682,8 +685,9 @@ app.post("/v1/upload", requireJWT, async (req, res) => {
     const asset = await uploadAsset(token, buf, filename, mime);
     res.json({ asset_id: asset.id, asset, account: acct.email });
   } catch (e) {
-    slog("ERROR", `POST /v1/upload: ${e.message}`);
-    res.status(500).json({ error: e.message });
+    const detail = e.data ? ` | ${String(e.data).slice(0, 300)}` : "";
+    slog("ERROR", `POST /v1/upload: ${e.message}${detail}`);
+    res.status(e.status || 500).json({ error: e.message, detail: e.data || null });
   }
 });
 
