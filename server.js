@@ -560,7 +560,7 @@ app.get("/logs", (req, res) => {
 
 // ── Generation endpoints ──────────────────────────────────────────────────────
 app.post("/v1/images/generate", requireJWT, async (req, res) => {
-  const { prompt, model, model_id, aspect_ratio = "1:1", generations_count = 1, ref_url, ref_asset_id: bodyRefAssetId } = req.body;
+  const { prompt, model, model_id, aspect_ratio = "1:1", generations_count = 1, ref_url, ref_image_data } = req.body;
   if (!prompt) return res.status(400).json({ error: "prompt is required" });
 
   const actualModel = model_id || model || "gemini-2.5-flash-image";
@@ -575,14 +575,24 @@ app.post("/v1/images/generate", requireJWT, async (req, res) => {
       const { images, project_id, usedAcct } = await tryWithFallback(async (acct) => {
         const token = await getActiveToken(acct);
 
-        let ref_asset_id = bodyRefAssetId || null;
-        if (!ref_asset_id && ref_url) {
-          const imgRes = await fetch(ref_url, { signal: AbortSignal.timeout(30000) });
-          if (!imgRes.ok) throw new Error(`Failed to fetch reference image: ${imgRes.status}`);
-          const buf = Buffer.from(await imgRes.arrayBuffer());
-          const mime = imgRes.headers.get("content-type") || "image/jpeg";
-          const asset = await uploadAsset(token, buf, `ref.${mime.split("/")[1] || "jpg"}`, mime);
-          ref_asset_id = asset.id;
+        let ref_asset_id = null;
+        const refSource = ref_image_data || ref_url || null;
+        if (refSource) {
+          if (refSource.startsWith("data:")) {
+            const m = refSource.match(/^data:([^;]+);base64,(.+)$/s);
+            if (!m) throw new Error("Invalid ref_image_data format");
+            const buf = Buffer.from(m[2], "base64");
+            const mime = m[1];
+            const asset = await uploadAsset(token, buf, `ref.${mime.split("/")[1] || "jpg"}`, mime);
+            ref_asset_id = asset.id;
+          } else {
+            const imgRes = await fetch(refSource, { signal: AbortSignal.timeout(30000) });
+            if (!imgRes.ok) throw new Error(`Failed to fetch reference image: ${imgRes.status}`);
+            const buf = Buffer.from(await imgRes.arrayBuffer());
+            const mime = imgRes.headers.get("content-type") || "image/jpeg";
+            const asset = await uploadAsset(token, buf, `ref.${mime.split("/")[1] || "jpg"}`, mime);
+            ref_asset_id = asset.id;
+          }
         }
 
         slog("INFO", `[image] job=${job.id} calling generate model=${actualModel} account=${acct.email}`);
@@ -613,7 +623,8 @@ app.post("/v1/images/generate", requireJWT, async (req, res) => {
 });
 
 app.post("/v1/videos/generate", requireJWT, async (req, res) => {
-  const { prompt, model, model_id, aspect_ratio = "16:9", duration_secs, generate_audio = true, start_image_url, end_image_url, start_asset_id: bodyStartAssetId, end_asset_id: bodyEndAssetId } = req.body;
+  const { prompt, model, model_id, aspect_ratio = "16:9", duration_secs, generate_audio = true,
+    start_image_url, end_image_url, start_image_data, end_image_data } = req.body;
   if (!prompt) return res.status(400).json({ error: "prompt is required" });
 
   const actualModel = model_id || model || "flux-3-video";
@@ -628,8 +639,19 @@ app.post("/v1/videos/generate", requireJWT, async (req, res) => {
       const { project_id: vProjectId, video_url, usedAcct } = await tryWithFallback(async (acct) => {
         const token = await getActiveToken(acct);
 
+        async function uploadFromDataUrl(dataUrl) {
+          // data:mime/type;base64,<data>
+          const m = dataUrl.match(/^data:([^;]+);base64,(.+)$/s);
+          if (!m) throw new Error("Invalid data URL");
+          const mime = m[1];
+          const buf = Buffer.from(m[2], "base64");
+          const asset = await uploadAsset(token, buf, `asset.${mime.split("/")[1] || "jpg"}`, mime);
+          return asset.id;
+        }
+
         async function fetchAndUpload(url) {
           if (!url) return null;
+          if (url.startsWith("data:")) return uploadFromDataUrl(url);
           const r = await fetch(url, { signal: AbortSignal.timeout(30000) });
           if (!r.ok) throw new Error(`Failed to fetch asset: ${r.status}`);
           const buf = Buffer.from(await r.arrayBuffer());
@@ -638,8 +660,8 @@ app.post("/v1/videos/generate", requireJWT, async (req, res) => {
           return asset.id;
         }
 
-        const start_asset_id = bodyStartAssetId || await fetchAndUpload(start_image_url);
-        const end_asset_id = bodyEndAssetId || await fetchAndUpload(end_image_url);
+        const start_asset_id = await fetchAndUpload(start_image_data || start_image_url);
+        const end_asset_id = await fetchAndUpload(end_image_data || end_image_url);
 
         const { project_id } = await generateVideo(token, {
           prompt, model_id: actualModel, aspect_ratio, duration_secs, generate_audio,
