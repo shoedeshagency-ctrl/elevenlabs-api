@@ -306,8 +306,8 @@ async function generateVideo(idToken, { prompt, model_id, aspect_ratio, duration
   const model_params = { aspect_ratio };
   if (duration_secs) model_params.duration_secs = duration_secs;
   if (generate_audio !== undefined) model_params.generate_audio = generate_audio;
-  if (start_asset_id) model_params.start_image = { content_asset_id: start_asset_id };
-  if (end_asset_id) model_params.end_image = { content_asset_id: end_asset_id };
+  if (start_asset_id) model_params.start_frame = { content_asset_id: start_asset_id };
+  if (end_asset_id) model_params.end_frame = { content_asset_id: end_asset_id };
   const body = { prompt, model_id, generations_count: 1, model_parameters: model_params };
   const resp = await apiPost(`${API_BASE}/projects/content/generate`, body, getHeaders(idToken));
   return {
@@ -579,7 +579,7 @@ app.post("/v1/images/generate", requireJWT, async (req, res) => {
 });
 
 app.post("/v1/videos/generate", requireJWT, async (req, res) => {
-  const { prompt, model, model_id, aspect_ratio = "16:9", duration_secs, generate_audio = true, start_image_url, end_image_url } = req.body;
+  const { prompt, model, model_id, aspect_ratio = "16:9", duration_secs, generate_audio = true, start_image_url, end_image_url, start_asset_id: bodyStartAssetId, end_asset_id: bodyEndAssetId } = req.body;
   if (!prompt) return res.status(400).json({ error: "prompt is required" });
 
   const actualModel = model_id || model || "flux-3-video";
@@ -604,8 +604,8 @@ app.post("/v1/videos/generate", requireJWT, async (req, res) => {
           return asset.id;
         }
 
-        const start_asset_id = await fetchAndUpload(start_image_url);
-        const end_asset_id = await fetchAndUpload(end_image_url);
+        const start_asset_id = bodyStartAssetId || await fetchAndUpload(start_image_url);
+        const end_asset_id = bodyEndAssetId || await fetchAndUpload(end_image_url);
 
         const { project_id } = await generateVideo(token, {
           prompt, model_id: actualModel, aspect_ratio, duration_secs, generate_audio,
