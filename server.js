@@ -277,23 +277,10 @@ async function readSSE(url, headers, timeoutMs = 180000) {
 }
 
 // ── ElevenLabs API calls ──────────────────────────────────────────────────────
-// Models that use reference_images[] for reference/style input (GPT-family).
-// All other image-to-image models use images[] (Kling, Flux, etc.)
-const GPT_IMAGE_MODELS = new Set([
-  "gpt-image-2.5-sunburst",
-  "gpt-image-2.5-flash",
-  "gpt-image-2.5",
-  "gpt-image-2",
-]);
-
 async function generateImage(idToken, { prompt, model_id, aspect_ratio, generations_count, ref_asset_id }) {
   const model_params = { aspect_ratio };
   if (ref_asset_id) {
-    if (GPT_IMAGE_MODELS.has(model_id)) {
-      model_params.reference_images = [{ content_asset_id: ref_asset_id }];
-    } else {
-      model_params.images = [{ content_asset_id: ref_asset_id }];
-    }
+    model_params.images = [{ content_asset_id: ref_asset_id }];
   }
   const body = {
     prompt,
