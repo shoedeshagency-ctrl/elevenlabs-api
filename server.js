@@ -211,14 +211,46 @@ async function tryWithFallback(fn) {
   throw lastErr || new Error("All accounts failed");
 }
 
+// ── Proxy support (for geo-blocked models like ByteDance Seedance) ────────────
+// Set BYTEDANCE_PROXY env var to route ByteDance requests through a residential proxy.
+// Format: http://user:pass@host:port
+let _proxyAgent = null;
+function getProxyAgent() {
+  if (_proxyAgent) return _proxyAgent;
+  const proxyUrl = process.env.BYTEDANCE_PROXY;
+  if (!proxyUrl) return null;
+  try {
+    const { ProxyAgent } = require("undici");
+    _proxyAgent = new ProxyAgent(proxyUrl);
+    slog("INFO", `Proxy agent ready for ByteDance: ${proxyUrl.replace(/:([^@]+)@/, ":***@")}`);
+  } catch (e) {
+    slog("WARN", `Failed to init proxy agent: ${e.message}`);
+  }
+  return _proxyAgent;
+}
+
+function isByteDanceModel(model_id) {
+  return typeof model_id === "string" && model_id.startsWith("bytedance-");
+}
+
+// fetch() wrapper that routes through proxy when dispatcher is provided
+async function proxyFetch(url, opts, dispatcher) {
+  if (dispatcher) {
+    const { fetch: undiciFetch } = require("undici");
+    return undiciFetch(url, { ...opts, dispatcher });
+  }
+  return fetch(url, opts);
+}
+
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
-async function apiPost(url, body, headers) {
-  const res = await fetch(url, {
+async function apiPost(url, body, headers, { useProxy = false } = {}) {
+  const dispatcher = useProxy ? getProxyAgent() : null;
+  const res = await proxyFetch(url, {
     method: "POST",
     headers,
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(30000),
-  });
+  }, dispatcher);
   const text = await res.text();
   let data;
   try { data = JSON.parse(text); } catch { data = { _raw: text }; }
@@ -233,14 +265,15 @@ async function apiGet(url, headers) {
 }
 
 // Read SSE stream until completion or timeout, returns completed event data
-async function readSSE(url, headers, timeoutMs = 180000) {
+async function readSSE(url, headers, timeoutMs = 180000, { useProxy = false } = {}) {
+  const dispatcher = useProxy ? getProxyAgent() : null;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(url, {
+    const res = await proxyFetch(url, {
       headers: { ...headers, "accept": "text/event-stream" },
       signal: controller.signal,
-    });
+    }, dispatcher);
     if (!res.ok) {
       const body = await res.text().catch(() => "");
       throw Object.assign(new Error(`SSE ${res.status}`), { status: res.status, data: body });
@@ -296,10 +329,10 @@ async function generateImage(idToken, { prompt, model_id, aspect_ratio, generati
   };
 }
 
-async function waitForImageCompletion(idToken, project_id) {
+async function waitForImageCompletion(idToken, project_id, { useProxy = false } = {}) {
   const url = `${API_BASE}/projects/content/${project_id}/generation-status`;
   const headers = { ...APP_HEADERS, "authorization": `Bearer ${idToken}` };
-  return readSSE(url, headers, 180000);
+  return readSSE(url, headers, 180000, { useProxy });
 }
 
 async function generateVideo(idToken, { prompt, model_id, aspect_ratio, duration_secs, generate_audio, start_asset_id, end_asset_id }) {
@@ -309,7 +342,8 @@ async function generateVideo(idToken, { prompt, model_id, aspect_ratio, duration
   if (start_asset_id) model_params.start_frame = { content_asset_id: start_asset_id };
   if (end_asset_id) model_params.end_frame = { content_asset_id: end_asset_id };
   const body = { prompt, model_id, generations_count: 1, model_parameters: model_params };
-  const resp = await apiPost(`${API_BASE}/projects/content/generate`, body, getHeaders(idToken));
+  const useProxy = isByteDanceModel(model_id);
+  const resp = await apiPost(`${API_BASE}/projects/content/generate`, body, getHeaders(idToken), { useProxy });
   return {
     project_id: resp.project_id,
     session_id: resp.last_generation_session_id,
@@ -612,7 +646,7 @@ app.post("/v1/videos/generate", requireJWT, async (req, res) => {
           start_asset_id, end_asset_id,
         });
 
-        const result = await waitForImageCompletion(token, project_id);
+        const result = await waitForImageCompletion(token, project_id, { useProxy: isByteDanceModel(actualModel) });
         const video_url = result.content_url || result.video_url;
         return { project_id, video_url, usedAcct: acct.email };
       });
