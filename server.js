@@ -329,10 +329,10 @@ async function generateImage(idToken, { prompt, model_id, aspect_ratio, generati
   };
 }
 
-async function waitForImageCompletion(idToken, project_id, { useProxy = false } = {}) {
+async function waitForImageCompletion(idToken, project_id, { useProxy = false, timeoutMs = 360000 } = {}) {
   const url = `${API_BASE}/projects/content/${project_id}/generation-status`;
   const headers = { ...APP_HEADERS, "authorization": `Bearer ${idToken}` };
-  return readSSE(url, headers, 180000, { useProxy });
+  return readSSE(url, headers, timeoutMs, { useProxy });
 }
 
 async function generateVideo(idToken, { prompt, model_id, aspect_ratio, duration_secs, generate_audio, start_asset_id, end_asset_id }) {
