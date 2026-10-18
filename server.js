@@ -526,7 +526,7 @@ app.get("/logs", (req, res) => {
 
 // ── Generation endpoints ──────────────────────────────────────────────────────
 app.post("/v1/images/generate", requireJWT, async (req, res) => {
-  const { prompt, model, model_id, aspect_ratio = "1:1", generations_count = 1, ref_url } = req.body;
+  const { prompt, model, model_id, aspect_ratio = "1:1", generations_count = 1, ref_url, ref_asset_id: bodyRefAssetId } = req.body;
   if (!prompt) return res.status(400).json({ error: "prompt is required" });
 
   const actualModel = model_id || model || "gemini-2.5-flash-image";
@@ -541,8 +541,8 @@ app.post("/v1/images/generate", requireJWT, async (req, res) => {
       const { images, project_id, usedAcct } = await tryWithFallback(async (acct) => {
         const token = await getActiveToken(acct);
 
-        let ref_asset_id = null;
-        if (ref_url) {
+        let ref_asset_id = bodyRefAssetId || null;
+        if (!ref_asset_id && ref_url) {
           const imgRes = await fetch(ref_url, { signal: AbortSignal.timeout(30000) });
           if (!imgRes.ok) throw new Error(`Failed to fetch reference image: ${imgRes.status}`);
           const buf = Buffer.from(await imgRes.arrayBuffer());
