@@ -317,11 +317,14 @@ async function generateVideo(idToken, { prompt, model_id, aspect_ratio, duration
 
 async function uploadAsset(idToken, fileBuffer, filename, mimeType) {
   const boundary = crypto.randomUUID();
-  const header = Buffer.from(
+  const namePart = Buffer.from(
+    `--${boundary}\r\nContent-Disposition: form-data; name="name"\r\n\r\n${filename}\r\n`
+  );
+  const filePart = Buffer.from(
     `--${boundary}\r\nContent-Disposition: form-data; name="asset"; filename="${filename}"\r\nContent-Type: ${mimeType}\r\n\r\n`
   );
   const footer = Buffer.from(`\r\n--${boundary}--\r\n`);
-  const body = Buffer.concat([header, fileBuffer, footer]);
+  const body = Buffer.concat([namePart, filePart, fileBuffer, footer]);
   const hdrs = {
     ...APP_HEADERS,
     "authorization": `Bearer ${idToken}`,
