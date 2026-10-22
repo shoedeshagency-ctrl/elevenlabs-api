@@ -200,8 +200,9 @@ async function tryWithFallback(fn) {
       return await fn(acct);
     } catch (e) {
       const status = e.status;
-      if (status === 401 || status === 403) {
-        slog("WARN", `account ${acct.email} returned ${status}, trying next`);
+      const isPaymentIssue = typeof e.data === "string" && e.data.includes("payment_issue");
+      if (status === 401 || status === 403 || isPaymentIssue) {
+        slog("WARN", `account ${acct.email} returned ${status}${isPaymentIssue ? " (payment_issue)" : ""}, trying next`);
         lastErr = e;
         continue;
       }
@@ -769,36 +770,40 @@ app.post("/v1/tts/stream", requireJWT, async (req, res) => {
   if (!text) return res.status(400).json({ error: "text is required" });
 
   try {
-    const { token, acct } = await tryWithFallbackRaw();
-    const body = { text, model_id, apply_text_normalization };
-    if (voice_settings) body.voice_settings = voice_settings;
-    if (language_code)  body.language_code  = language_code;
-    if (seed !== undefined) body.seed = seed;
-    if (previous_text) body.previous_text = previous_text;
-    if (next_text)     body.next_text = next_text;
+    const { audioBuffer, historyId, charCost, latencyMs, usedAcct } = await tryWithFallback(async (acct) => {
+      const token = await getActiveToken(acct);
+      const body = { text, model_id, apply_text_normalization };
+      if (voice_settings) body.voice_settings = voice_settings;
+      if (language_code)  body.language_code  = language_code;
+      if (seed !== undefined) body.seed = seed;
+      if (previous_text) body.previous_text = previous_text;
+      if (next_text)     body.next_text = next_text;
 
-    const upstream = await fetch(`${EL_BASE}/text-to-speech/${encodeURIComponent(voice_id)}?output_format=${output_format}`, {
-      method: "POST",
-      headers: elHeaders(token, { accept: "audio/mpeg" }),
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(60000),
+      const upstream = await fetch(`${EL_BASE}/text-to-speech/${encodeURIComponent(voice_id)}?output_format=${output_format}`, {
+        method: "POST",
+        headers: elHeaders(token, { accept: "audio/mpeg" }),
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(60000),
+      });
+      if (!upstream.ok) {
+        const err = await upstream.text().catch(() => "");
+        throw Object.assign(new Error(`EL API error ${upstream.status}`), { status: upstream.status, data: err });
+      }
+      const buf = Buffer.from(await upstream.arrayBuffer());
+      return {
+        audioBuffer: buf,
+        historyId: upstream.headers.get("history-item-id") || "",
+        charCost: upstream.headers.get("character-cost") || "",
+        latencyMs: upstream.headers.get("tts-latency-ms") || "",
+        usedAcct: acct.email,
+      };
     });
-    if (!upstream.ok) {
-      const err = await upstream.text().catch(() => "");
-      return res.status(upstream.status).json({ error: `EL API error ${upstream.status}`, detail: err });
-    }
     res.setHeader("content-type", "audio/mpeg");
-    res.setHeader("x-history-item-id",  upstream.headers.get("history-item-id") || "");
-    res.setHeader("x-character-cost",   upstream.headers.get("character-cost") || "");
-    res.setHeader("x-tts-latency-ms",   upstream.headers.get("tts-latency-ms") || "");
-    res.setHeader("x-account",          acct.email);
-    const reader = upstream.body.getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      res.write(Buffer.from(value));
-    }
-    res.end();
+    res.setHeader("x-history-item-id", historyId);
+    res.setHeader("x-character-cost",  charCost);
+    res.setHeader("x-tts-latency-ms",  latencyMs);
+    res.setHeader("x-account",         usedAcct);
+    res.end(audioBuffer);
   } catch (e) {
     slog("ERROR", `POST /v1/tts/stream: ${e.message}`);
     if (!res.headersSent) res.status(e.status || 500).json({ error: e.message });
