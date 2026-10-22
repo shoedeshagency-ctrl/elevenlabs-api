@@ -710,6 +710,421 @@ app.post("/v1/videos/generate", requireJWT, async (req, res) => {
   });
 });
 
+// ── Voice / TTS helpers ───────────────────────────────────────────────────────
+const EL_BASE = "https://api.elevenlabs.io/v1";
+
+function elHeaders(idToken, extra = {}) {
+  return { "authorization": `Bearer ${idToken}`, "content-type": "application/json", ...extra };
+}
+
+async function elGet(idToken, path) {
+  const res = await fetch(`${EL_BASE}${path}`, { headers: elHeaders(idToken), signal: AbortSignal.timeout(20000) });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw Object.assign(new Error(`EL API error ${res.status}`), { status: res.status, data: body });
+  }
+  return res.json();
+}
+
+async function elPost(idToken, path, body, accept = "application/json") {
+  const res = await fetch(`${EL_BASE}${path}`, {
+    method: "POST",
+    headers: elHeaders(idToken, { accept }),
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(60000),
+  });
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => "");
+    throw Object.assign(new Error(`EL API error ${res.status}`), { status: res.status, data: errBody });
+  }
+  if (accept === "audio/mpeg" || accept === "audio/*") return res;
+  return res.json();
+}
+
+async function elPostForm(idToken, path, formData) {
+  const res = await fetch(`${EL_BASE}${path}`, {
+    method: "POST",
+    headers: { "authorization": `Bearer ${idToken}` },
+    body: formData,
+    signal: AbortSignal.timeout(120000),
+  });
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => "");
+    throw Object.assign(new Error(`EL API error ${res.status}`), { status: res.status, data: errBody });
+  }
+  return res.json();
+}
+
+// ── TTS — streaming audio directly ───────────────────────────────────────────
+// POST /v1/tts/stream — returns raw audio immediately (no job)
+app.post("/v1/tts/stream", requireJWT, async (req, res) => {
+  const {
+    text, voice_id = "21m00Tcm4TlvDq8ikWAM",
+    model_id = "eleven_multilingual_v2",
+    voice_settings, language_code,
+    apply_text_normalization = "auto",
+    output_format = "mp3_44100_128",
+    seed, previous_text, next_text,
+  } = req.body;
+  if (!text) return res.status(400).json({ error: "text is required" });
+
+  try {
+    const { token, acct } = await tryWithFallbackRaw();
+    const body = { text, model_id, apply_text_normalization };
+    if (voice_settings) body.voice_settings = voice_settings;
+    if (language_code)  body.language_code  = language_code;
+    if (seed !== undefined) body.seed = seed;
+    if (previous_text) body.previous_text = previous_text;
+    if (next_text)     body.next_text = next_text;
+
+    const upstream = await fetch(`${EL_BASE}/text-to-speech/${encodeURIComponent(voice_id)}?output_format=${output_format}`, {
+      method: "POST",
+      headers: elHeaders(token, { accept: "audio/mpeg" }),
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(60000),
+    });
+    if (!upstream.ok) {
+      const err = await upstream.text().catch(() => "");
+      return res.status(upstream.status).json({ error: `EL API error ${upstream.status}`, detail: err });
+    }
+    res.setHeader("content-type", "audio/mpeg");
+    res.setHeader("x-history-item-id",  upstream.headers.get("history-item-id") || "");
+    res.setHeader("x-character-cost",   upstream.headers.get("character-cost") || "");
+    res.setHeader("x-tts-latency-ms",   upstream.headers.get("tts-latency-ms") || "");
+    res.setHeader("x-account",          acct.email);
+    const reader = upstream.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      res.write(Buffer.from(value));
+    }
+    res.end();
+  } catch (e) {
+    slog("ERROR", `POST /v1/tts/stream: ${e.message}`);
+    if (!res.headersSent) res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// POST /v1/tts/generate — async job (returns job_id, poll /v1/jobs/:id)
+app.post("/v1/tts/generate", requireJWT, async (req, res) => {
+  const {
+    text, voice_id = "21m00Tcm4TlvDq8ikWAM",
+    model_id = "eleven_multilingual_v2",
+    voice_settings, language_code,
+    apply_text_normalization = "auto",
+    output_format = "mp3_44100_128",
+    seed, previous_text, next_text,
+  } = req.body;
+  if (!text) return res.status(400).json({ error: "text is required" });
+
+  const job = createJob("tts", { voice_id, model_id });
+  res.status(202).json({ job_id: job.id, status: "queued", retry_after: 2, poll_url: `/v1/jobs/${job.id}` });
+
+  setImmediate(async () => {
+    try {
+      updateJob(job.id, { status: "processing" });
+      const { audio_base64, history_item_id, character_cost, usedAcct } = await tryWithFallback(async (acct) => {
+        const token = await getActiveToken(acct);
+        const body = { text, model_id, apply_text_normalization };
+        if (voice_settings) body.voice_settings = voice_settings;
+        if (language_code)  body.language_code  = language_code;
+        if (seed !== undefined) body.seed = seed;
+        if (previous_text) body.previous_text = previous_text;
+        if (next_text)     body.next_text = next_text;
+
+        const upstream = await fetch(`${EL_BASE}/text-to-speech/${encodeURIComponent(voice_id)}?output_format=${output_format}`, {
+          method: "POST",
+          headers: elHeaders(token, { accept: "audio/mpeg" }),
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(60000),
+        });
+        if (!upstream.ok) {
+          const err = await upstream.text().catch(() => "");
+          throw Object.assign(new Error(`EL API error ${upstream.status}`), { status: upstream.status, data: err });
+        }
+        const buf = Buffer.from(await upstream.arrayBuffer());
+        return {
+          audio_base64: buf.toString("base64"),
+          history_item_id: upstream.headers.get("history-item-id") || null,
+          character_cost: upstream.headers.get("character-cost") || null,
+          usedAcct: acct.email,
+        };
+      });
+      updateJob(job.id, { status: "completed", account: usedAcct, result: { audio_base64, history_item_id, character_cost, format: output_format }, retry_after: undefined });
+      slog("INFO", `[tts] job=${job.id} done chars=${character_cost} account=${usedAcct}`);
+    } catch (e) {
+      slog("ERROR", `[tts] job=${job.id} failed: ${e.message}`);
+      updateJob(job.id, { status: "failed", error: e.message });
+    }
+  });
+});
+
+// ── Voice list ────────────────────────────────────────────────────────────────
+// GET /v1/voices — list own voices
+app.get("/v1/voices", requireJWT, async (req, res) => {
+  try {
+    const acct = pickAccount();
+    if (!acct) return res.status(503).json({ error: "No active accounts" });
+    const token = await getActiveToken(acct);
+    const data = await elGet(token, "/voices");
+    res.json(data);
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// GET /v1/voices/shared — search shared voice library
+app.get("/v1/voices/shared", requireJWT, async (req, res) => {
+  try {
+    const acct = pickAccount();
+    if (!acct) return res.status(503).json({ error: "No active accounts" });
+    const token = await getActiveToken(acct);
+    const params = new URLSearchParams();
+    if (req.query.page_size) params.set("page_size", req.query.page_size);
+    if (req.query.gender)    params.set("gender", req.query.gender);
+    if (req.query.language)  params.set("language", req.query.language);
+    if (req.query.accent)    params.set("accent", req.query.accent);
+    if (req.query.age)       params.set("age", req.query.age);
+    if (req.query.search)    params.set("search", req.query.search);
+    if (req.query.category)  params.set("category", req.query.category);
+    if (req.query.sort)      params.set("sort", req.query.sort);
+    const data = await elGet(token, `/shared-voices?${params}`);
+    res.json(data);
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// GET /v1/voices/:voice_id — get single voice details
+app.get("/v1/voices/:voice_id", requireJWT, async (req, res) => {
+  try {
+    const acct = pickAccount();
+    if (!acct) return res.status(503).json({ error: "No active accounts" });
+    const token = await getActiveToken(acct);
+    const data = await elGet(token, `/voices/${encodeURIComponent(req.params.voice_id)}`);
+    res.json(data);
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// GET /v1/voices/models — list TTS models
+app.get("/v1/tts/models", requireJWT, async (req, res) => {
+  try {
+    const acct = pickAccount();
+    if (!acct) return res.status(503).json({ error: "No active accounts" });
+    const token = await getActiveToken(acct);
+    const data = await elGet(token, "/models");
+    res.json(data);
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// ── Voice cloning ─────────────────────────────────────────────────────────────
+// POST /v1/voices/clone — instant voice clone from audio sample(s)
+app.post("/v1/voices/clone", requireJWT, async (req, res) => {
+  const { name, description, labels, files } = req.body;
+  // files: array of { data: "data:audio/...;base64,...", filename: "sample.mp3" }
+  if (!name)  return res.status(400).json({ error: "name is required" });
+  if (!files?.length) return res.status(400).json({ error: "files (audio samples) required" });
+
+  try {
+    const acct = pickAccount();
+    if (!acct) return res.status(503).json({ error: "No active accounts" });
+    const token = await getActiveToken(acct);
+
+    const form = new FormData();
+    form.append("name", name);
+    if (description) form.append("description", description);
+    if (labels) form.append("labels", typeof labels === "string" ? labels : JSON.stringify(labels));
+    for (const f of files) {
+      const m = f.data.match(/^data:([^;]+);base64,(.+)$/s);
+      if (!m) throw new Error("Invalid audio data URL in files");
+      const mime = m[1];
+      const buf = Buffer.from(m[2], "base64");
+      const blob = new Blob([buf], { type: mime });
+      form.append("files", blob, f.filename || `sample.${mime.split("/")[1] || "mp3"}`);
+    }
+
+    const upstream = await fetch(`${EL_BASE}/voices/add`, {
+      method: "POST",
+      headers: { "authorization": `Bearer ${token}` },
+      body: form,
+      signal: AbortSignal.timeout(60000),
+    });
+    if (!upstream.ok) {
+      const err = await upstream.text().catch(() => "");
+      return res.status(upstream.status).json({ error: `EL API error ${upstream.status}`, detail: err });
+    }
+    const data = await upstream.json();
+    res.json({ voice_id: data.voice_id, account: acct.email });
+  } catch (e) {
+    slog("ERROR", `POST /v1/voices/clone: ${e.message}`);
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// ── Speech to Speech (voice changer) ─────────────────────────────────────────
+// POST /v1/speech-to-speech — convert audio to a different voice
+app.post("/v1/speech-to-speech", requireJWT, async (req, res) => {
+  const { audio_data, voice_id = "21m00Tcm4TlvDq8ikWAM", model_id = "eleven_multilingual_sts_v2", voice_settings, output_format = "mp3_44100_128" } = req.body;
+  if (!audio_data) return res.status(400).json({ error: "audio_data (base64 data URL) is required" });
+
+  const job = createJob("sts", { voice_id, model_id });
+  res.status(202).json({ job_id: job.id, status: "queued", retry_after: 2, poll_url: `/v1/jobs/${job.id}` });
+
+  setImmediate(async () => {
+    try {
+      updateJob(job.id, { status: "processing" });
+      const { audio_base64, usedAcct } = await tryWithFallback(async (acct) => {
+        const token = await getActiveToken(acct);
+        const m = audio_data.match(/^data:([^;]+);base64,(.+)$/s);
+        if (!m) throw new Error("Invalid audio data URL");
+        const mime = m[1]; const buf = Buffer.from(m[2], "base64");
+
+        const form = new FormData();
+        form.append("audio", new Blob([buf], { type: mime }), `audio.${mime.split("/")[1] || "mp3"}`);
+        form.append("model_id", model_id);
+        if (voice_settings) form.append("voice_settings", JSON.stringify(voice_settings));
+
+        const upstream = await fetch(`${EL_BASE}/speech-to-speech/${encodeURIComponent(voice_id)}?output_format=${output_format}`, {
+          method: "POST",
+          headers: { "authorization": `Bearer ${token}` },
+          body: form,
+          signal: AbortSignal.timeout(120000),
+        });
+        if (!upstream.ok) {
+          const err = await upstream.text().catch(() => "");
+          throw Object.assign(new Error(`EL API error ${upstream.status}`), { status: upstream.status, data: err });
+        }
+        const outBuf = Buffer.from(await upstream.arrayBuffer());
+        return { audio_base64: outBuf.toString("base64"), usedAcct: acct.email };
+      });
+      updateJob(job.id, { status: "completed", account: usedAcct, result: { audio_base64, format: output_format }, retry_after: undefined });
+      slog("INFO", `[sts] job=${job.id} done account=${usedAcct}`);
+    } catch (e) {
+      slog("ERROR", `[sts] job=${job.id} failed: ${e.message}`);
+      updateJob(job.id, { status: "failed", error: e.message });
+    }
+  });
+});
+
+// ── Audio isolation (background removal) ──────────────────────────────────────
+// POST /v1/audio-isolation — remove background noise from audio
+app.post("/v1/audio-isolation", requireJWT, async (req, res) => {
+  const { audio_data } = req.body;
+  if (!audio_data) return res.status(400).json({ error: "audio_data (base64 data URL) is required" });
+
+  const job = createJob("audio-isolation", {});
+  res.status(202).json({ job_id: job.id, status: "queued", retry_after: 2, poll_url: `/v1/jobs/${job.id}` });
+
+  setImmediate(async () => {
+    try {
+      updateJob(job.id, { status: "processing" });
+      const { audio_base64, usedAcct } = await tryWithFallback(async (acct) => {
+        const token = await getActiveToken(acct);
+        const m = audio_data.match(/^data:([^;]+);base64,(.+)$/s);
+        if (!m) throw new Error("Invalid audio data URL");
+        const mime = m[1]; const buf = Buffer.from(m[2], "base64");
+
+        const form = new FormData();
+        form.append("audio", new Blob([buf], { type: mime }), `audio.${mime.split("/")[1] || "mp3"}`);
+
+        const upstream = await fetch(`${EL_BASE}/audio-isolation`, {
+          method: "POST",
+          headers: { "authorization": `Bearer ${token}` },
+          body: form,
+          signal: AbortSignal.timeout(120000),
+        });
+        if (!upstream.ok) {
+          const err = await upstream.text().catch(() => "");
+          throw Object.assign(new Error(`EL API error ${upstream.status}`), { status: upstream.status, data: err });
+        }
+        const outBuf = Buffer.from(await upstream.arrayBuffer());
+        return { audio_base64: outBuf.toString("base64"), usedAcct: acct.email };
+      });
+      updateJob(job.id, { status: "completed", account: usedAcct, result: { audio_base64 }, retry_after: undefined });
+      slog("INFO", `[audio-isolation] job=${job.id} done account=${usedAcct}`);
+    } catch (e) {
+      slog("ERROR", `[audio-isolation] job=${job.id} failed: ${e.message}`);
+      updateJob(job.id, { status: "failed", error: e.message });
+    }
+  });
+});
+
+// ── Sound effects generation ──────────────────────────────────────────────────
+// POST /v1/sound-effects/generate
+app.post("/v1/sound-effects/generate", requireJWT, async (req, res) => {
+  const { text, duration_seconds, prompt_influence, output_format = "mp3_44100_128" } = req.body;
+  if (!text) return res.status(400).json({ error: "text is required" });
+
+  const job = createJob("sound-effect", { text });
+  res.status(202).json({ job_id: job.id, status: "queued", retry_after: 2, poll_url: `/v1/jobs/${job.id}` });
+
+  setImmediate(async () => {
+    try {
+      updateJob(job.id, { status: "processing" });
+      const { audio_base64, usedAcct } = await tryWithFallback(async (acct) => {
+        const token = await getActiveToken(acct);
+        const body = { text, output_format };
+        if (duration_seconds !== undefined) body.duration_seconds = duration_seconds;
+        if (prompt_influence !== undefined) body.prompt_influence = prompt_influence;
+
+        const upstream = await fetch(`${EL_BASE}/sound-generation`, {
+          method: "POST",
+          headers: elHeaders(token, { accept: "audio/mpeg" }),
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(60000),
+        });
+        if (!upstream.ok) {
+          const err = await upstream.text().catch(() => "");
+          throw Object.assign(new Error(`EL API error ${upstream.status}`), { status: upstream.status, data: err });
+        }
+        const buf = Buffer.from(await upstream.arrayBuffer());
+        return { audio_base64: buf.toString("base64"), usedAcct: acct.email };
+      });
+      updateJob(job.id, { status: "completed", account: usedAcct, result: { audio_base64, format: output_format }, retry_after: undefined });
+      slog("INFO", `[sfx] job=${job.id} done account=${usedAcct}`);
+    } catch (e) {
+      slog("ERROR", `[sfx] job=${job.id} failed: ${e.message}`);
+      updateJob(job.id, { status: "failed", error: e.message });
+    }
+  });
+});
+
+// ── TTS History ───────────────────────────────────────────────────────────────
+// GET /v1/tts/history
+app.get("/v1/tts/history", requireJWT, async (req, res) => {
+  try {
+    const acct = pickAccount();
+    if (!acct) return res.status(503).json({ error: "No active accounts" });
+    const token = await getActiveToken(acct);
+    const params = new URLSearchParams();
+    if (req.query.page_size)        params.set("page_size", req.query.page_size);
+    if (req.query.start_after_history_item_id) params.set("start_after_history_item_id", req.query.start_after_history_item_id);
+    const data = await elGet(token, `/history?${params}`);
+    res.json(data);
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// ── tryWithFallbackRaw — returns {token, acct} without wrapping ───────────────
+async function tryWithFallbackRaw() {
+  const active = accounts.filter(a => a.active !== false);
+  if (!active.length) throw new Error("No active accounts");
+  const shuffled = [...active].sort(() => Math.random() - 0.5);
+  let lastErr;
+  for (const acct of shuffled) {
+    try {
+      const token = await getActiveToken(acct);
+      return { token, acct };
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr;
+}
+
 // ── Job polling ───────────────────────────────────────────────────────────────
 app.get("/v1/jobs/:id", requireJWT, (req, res) => {
   const job = jobs.get(req.params.id);
